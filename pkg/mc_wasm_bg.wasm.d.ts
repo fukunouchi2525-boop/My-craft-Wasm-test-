@@ -1,0 +1,30 @@
+/* tslint:disable */
+/* eslint-disable */
+export const memory: WebAssembly.Memory;
+export const __wbg_game_free: (a: number, b: number) => void;
+export const __wbg_get_game_x: (a: number) => number;
+export const __wbg_get_game_y: (a: number) => number;
+export const __wbg_get_game_z: (a: number) => number;
+export const __wbg_set_game_x: (a: number, b: number) => void;
+export const __wbg_set_game_y: (a: number, b: number) => void;
+export const __wbg_set_game_z: (a: number, b: number) => void;
+export const game_act: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => number;
+export const game_dim: (a: number) => number;
+export const game_edit_n: (a: number) => number;
+export const game_ev_clear: (a: number) => void;
+export const game_ev_len: (a: number) => number;
+export const game_ev_ptr: (a: number) => number;
+export const game_in_portal: (a: number) => number;
+export const game_load_alloc: (a: number, b: number) => number;
+export const game_load_apply: (a: number) => number;
+export const game_mesh_ptr: (a: number, b: number, c: number) => number;
+export const game_mesh_quads: (a: number, b: number, c: number) => number;
+export const game_new: (a: number, b: number) => number;
+export const game_save_build: (a: number) => void;
+export const game_save_len: (a: number) => number;
+export const game_save_ptr: (a: number) => number;
+export const game_step: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
+export const game_switch_dim: (a: number) => void;
+export const game_update: (a: number, b: number, c: number) => void;
+export const __wbindgen_externrefs: WebAssembly.Table;
+export const __wbindgen_start: () => void;

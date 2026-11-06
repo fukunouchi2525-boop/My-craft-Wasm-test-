@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8"><title>3Dマイクラ 無限ワールド (Wasm + Three.js)</title>
+<style>
+body{margin:0;overflow:hidden;background:#7ec0ee;font-family:sans-serif;user-select:none}
+canvas{display:block;width:100vw;height:100vh}
+#crosshair{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);color:#fff;font-size:24px;font-weight:bold;pointer-events:none;text-shadow:1px 1px 2px #000}
+#instructions{position:absolute;top:10px;left:10px;color:#fff;background:rgba(0,0,0,.7);padding:12px;border-radius:5px;font-size:13px;line-height:1.6;pointer-events:none}
+#perf{margin-top:8px;color:#0f0;font-family:monospace;font-weight:bold}
+#ui{position:absolute;bottom:20px;left:50%;transform:translateX(-50%);background:rgba(0,0,0,.6);padding:10px 20px;border-radius:5px;display:flex;gap:15px;color:#fff;font-weight:bold}
+.slot{padding:5px 15px;border:2px solid #555;border-radius:3px}.slot.active{border-color:#fff;background:rgba(255,255,255,.3)}
+#reset{position:absolute;bottom:20px;left:10px;font-size:12px;padding:4px 8px;opacity:.7}
+#flash{position:absolute;inset:0;background:rgba(140,60,255,0);pointer-events:none}
+</style>
+<script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js"}}</script>
+</head>
+<body>
+<canvas id="c"></canvas><div id="flash"></div><button id="reset">セーブを消す</button><div id="crosshair">+</div>
+<div id="instructions"><b>【操作】</b> クリックで視点移動(Escで解除)<br>WASD:移動 / Space:ジャンプ / Shift or W2回:ダッシュ<br>1〜4:ブロック変更 / 左クリック:壊す / 右クリック(2本指)かE:置く<br>黒曜石で枠(内側2×3以上)を作り、枠に黒曜石をもう1回置くとゲート点火<div id="perf">FPS: 0</div></div>
+<div id="ui"><div class="slot active">■ 土</div><div class="slot">■ 石</div><div class="slot">■ 木</div><div class="slot">■ 黒曜石</div></div>
+<script type="module">
+import * as THREE from 'three';
+import init, { Game } from './pkg/mc_wasm.js';
+
+const RADIUS = 4;     // 描画距離(チャンク数)。重ければ3や2に
+const SCALE = 1;      // 解像度倍率。重ければ0.75や0.5に
+const SEED = 12345, MAXQ = 8192, BLOCKS = [2, 3, 4, 5];
+
+const wasm = await init();
+const game = new Game(RADIUS, SEED);
+
+// ---- セーブ/ロード: 差分(壊した/置いたブロック)をdeflate圧縮→base64→localStorage ----
+const KEY = 'mcw_save_v1', hasCS = typeof CompressionStream !== 'undefined';
+const b64 = u => { let s = ''; for (let i = 0; i < u.length; i += 8192) s += String.fromCharCode(...u.subarray(i, i + 8192)); return btoa(s); };
+const unb64 = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
+const pipe = async (u, S) => new Uint8Array(await new Response(new Blob([u]).stream().pipeThrough(new S('deflate-raw'))).arrayBuffer());
+let noSave = false;
+async function save(sync) {
+  if (noSave) return;
+  game.save_build();
+  const raw = new Uint8Array(wasm.memory.buffer, game.save_ptr(), game.save_len()).slice();
+  try {
+    if (hasCS && !sync) localStorage.setItem(KEY, 'z:' + b64(await pipe(raw, CompressionStream)));
+    else localStorage.setItem(KEY, 'r:' + b64(raw));   // ページを閉じる時は同期で保存
+  } catch (e) { console.warn('save failed', e); }
+}
+async function load() {
+  const s = localStorage.getItem(KEY); if (!s) return;
+  try {
+    let u = unb64(s.slice(2)); if (s[0] === 'z') u = await pipe(u, DecompressionStream);
+    const p = game.load_alloc(u.length); new Uint8Array(wasm.memory.buffer, p, u.length).set(u);
+    game.load_apply();
+  } catch (e) { console.warn('load failed', e); }
+}
+await load();
+
+const canvas = document.getElementById('c');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: false, powerPreference: 'low-power' });
+renderer.setPixelRatio(SCALE);
+const SKY = 0x7ec0ee, D = RADIUS * 16;
+const scene = new THREE.Scene(); scene.background = new THREE.Color(SKY); scene.fog = new THREE.Fog(SKY, D * .5, D - 4);
+const camera = new THREE.PerspectiveCamera(70, 1, 0.1, D + 32); camera.rotation.order = 'YXZ';
+function resize() { renderer.setSize(innerWidth, innerHeight, false); camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); }
+addEventListener('resize', resize); resize();
+
+// 影は面ごとの頂点カラーに焼き込み済みなので、ライト不要のBasicMaterial（最軽量）
+const mat = new THREE.MeshBasicMaterial({ vertexColors: true });
+// 全チャンク共通のインデックス（四角形i → 4i..4i+3）
+const idxArr = new Uint16Array(MAXQ * 6);
+for (let q = 0, b = 0; q < MAXQ; q++, b += 4) idxArr.set([b, b + 1, b + 2, b, b + 2, b + 3], q * 6);
+const IDX = new THREE.BufferAttribute(idxArr, 1);
+
+const meshes = new Map();
+
+// 雲: プレイヤーの周りでループするので、どこまで歩いても雲がある（InstancedMesh1個）
+const CN = 14, clouds = new THREE.InstancedMesh(new THREE.BoxGeometry(1, 1, 1), new THREE.MeshBasicMaterial({ color: 0xffffff, fog: false }), CN);
+clouds.frustumCulled = false; scene.add(clouds);
+const cl = Array.from({ length: CN }, () => ({ x: game.x + (Math.random() - .5) * 120, z: game.z + (Math.random() - .5) * 120, sx: 10 + Math.random() * 14, sz: 8 + Math.random() * 10 }));
+const cM = new THREE.Matrix4(), cP = new THREE.Vector3(), cS = new THREE.Vector3(), cQ = new THREE.Quaternion();
+function moveClouds(dt) {
+  cl.forEach((c, i) => {
+    c.x += 1.5 * dt;
+    if (c.x - game.x > 60) c.x -= 120; else if (c.x - game.x < -60) c.x += 120;
+    if (c.z - game.z > 60) c.z -= 120; else if (c.z - game.z < -60) c.z += 120;
+    clouds.setMatrixAt(i, cM.compose(cP.set(c.x, 72, c.z), cQ, cS.set(c.sx, 2, c.sz)));
+  });
+  clouds.instanceMatrix.needsUpdate = true;
+}
+const SKYS = [0x7ec0ee, 0x2a0808];
+function applyDim() { const d = game.dim(); scene.background.setHex(SKYS[d]); scene.fog.color.setHex(SKYS[d]); scene.fog.near = d ? D * .3 : D * .5; clouds.visible = !d; }
+applyDim();
+function drop(m) { scene.remove(m); m.geometry.setIndex(null); m.geometry.dispose(); }
+// Rustが通知したチャンクだけ、Wasmメモリの頂点データをコピーせず直接GPUへ渡す
+function syncChunks() {
+  const n = game.ev_len(); if (!n) return;
+  const ev = Array.from(new Int32Array(wasm.memory.buffer, game.ev_ptr(), n)); game.ev_clear();
+  for (let i = 0; i < n; i += 3) {
+    const [kind, cx, cz] = [ev[i], ev[i + 1], ev[i + 2]], key = cx + ',' + cz;
+    let m = meshes.get(key);
+    if (!kind) { if (m) { drop(m); meshes.delete(key); } continue; }
+    const quads = game.mesh_quads(cx, cz);
+    if (!m) { m = new THREE.Mesh(new THREE.BufferGeometry(), mat); m.matrixAutoUpdate = false; scene.add(m); meshes.set(key, m); }
+    const old = m.geometry; old.setIndex(null); old.dispose();
+    const g = m.geometry = new THREE.BufferGeometry();
+    if (!quads) { m.visible = false; continue; }
+    const ib = new THREE.InterleavedBuffer(new Float32Array(wasm.memory.buffer, game.mesh_ptr(cx, cz), quads * 24), 6);
+    g.setAttribute('position', new THREE.InterleavedBufferAttribute(ib, 3, 0));
+    g.setAttribute('color', new THREE.InterleavedBufferAttribute(ib, 3, 3));
+    g.setIndex(IDX); g.setDrawRange(0, quads * 6);
+    g.boundingSphere = new THREE.Sphere(new THREE.Vector3(cx * 16 + 8, 32, cz * 16 + 8), 50);
+    m.visible = true;
+  }
+}
+
+let yaw = 0, pitch = 0, locked = false, sel = 0;
+const keys = {}, dir = new THREE.Vector3();
+addEventListener('click', () => { if (!locked) canvas.requestPointerLock()?.catch?.(() => {}); });
+document.addEventListener('pointerlockchange', () => { locked = document.pointerLockElement === canvas; if (!locked) save(); });
+document.addEventListener('mousemove', e => { if (!locked) return; yaw -= e.movementX * .003; pitch = Math.max(-1.55, Math.min(1.55, pitch - e.movementY * .003)); });
+addEventListener('contextmenu', e => e.preventDefault());
+function act(place) { camera.getWorldDirection(dir); game.act(camera.position.x, camera.position.y, camera.position.z, dir.x, dir.y, dir.z, place, BLOCKS[sel]); }
+addEventListener('mousedown', e => { if (locked) act(e.button === 2); });
+let lastW = 0, sprintTap = false;
+addEventListener('keydown', e => {
+  if (e.code === 'KeyW' && !keys.KeyW) { const n = performance.now(); if (n - lastW < 250) sprintTap = true; lastW = n; }
+  keys[e.code] = true;
+  if (/^Digit[1-4]$/.test(e.code)) { sel = +e.code[5] - 1; document.querySelectorAll('.slot').forEach((s, i) => s.classList.toggle('active', i === sel)); }
+  if (e.code === 'KeyE' && locked && !e.repeat) act(true);
+});
+addEventListener('keyup', e => { keys[e.code] = false; if (e.code === 'KeyW') sprintTap = false; });
+
+const DT = 1000 / 60, perfEl = document.getElementById('perf');
+const flashEl = document.getElementById('flash');
+let armed = true, lastTp = 0, acc = 0, last = performance.now(), fc = 0, lp = last;
+function frame(now) {
+  requestAnimationFrame(frame);
+  acc = Math.min(acc + now - last, 100); const dt = (now - last) / 1000; last = now; fc++;
+  while (acc >= DT) {
+    acc -= DT; if (!locked) continue;
+    const fwd = (keys.KeyW ? 1 : 0) - (keys.KeyS ? 1 : 0), str = (keys.KeyD ? 1 : 0) - (keys.KeyA ? 1 : 0);
+    game.step(fwd, str, !!(keys.ShiftLeft || keys.ShiftRight || sprintTap), !!keys.Space, yaw);
+  }
+  const inP = game.in_portal(); if (!inP) armed = true;   // ポータルから一度出るまで再発動しない
+  if (locked && armed && inP && now - lastTp > 2000) {
+    armed = false; lastTp = now; game.switch_dim(); applyDim(); save();
+    flashEl.style.transition = 'none'; flashEl.style.background = game.dim() ? 'rgba(255,50,50,.5)' : 'rgba(140,60,255,.5)';
+    setTimeout(() => { flashEl.style.transition = 'background .5s'; flashEl.style.background = 'rgba(140,60,255,0)'; }, 50);
+  }
+  game.update(2, 2);   // Rustの処理を全部終えてから…
+  syncChunks();        // …メモリのビューを作って、すぐ描画（メモリ拡張で無効になるのを防ぐ）
+  moveClouds(dt);
+  camera.position.set(game.x, game.y + 1.62, game.z); camera.rotation.set(pitch, yaw, 0);
+  renderer.render(scene, camera);
+  if (now - lp >= 1000) { perfEl.textContent = `${game.dim() ? 'ネザー' : 'オーバーワールド'} | FPS: ${fc} | XYZ: ${game.x | 0}, ${game.y | 0}, ${game.z | 0}`; fc = 0; lp = now; }
+}
+// 自動セーブ: 5秒ごと(ブロックを変えた時か、プレイ中)、視点を離した時、ページを閉じる時
+let savedN = game.edit_n();
+setInterval(() => { const n = game.edit_n(); if (n !== savedN || locked) { savedN = n; save(); } }, 5000);
+addEventListener('pagehide', () => save(true));
+document.getElementById('reset').addEventListener('click', e => { e.stopPropagation(); if (confirm('セーブを消して最初から始める？')) { noSave = true; localStorage.removeItem(KEY); location.reload(); } });
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
